@@ -4,3 +4,4 @@ data_test/
 .venv/
 __pycache__/
 *.db
+data_dev/
