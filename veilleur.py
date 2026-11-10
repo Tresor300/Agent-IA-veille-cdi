@@ -1,4 +1,5 @@
-import os
+"""Veilleur — version CDI : visite les sites carrière, fait juger les nouvelles offres par l'IA
+(métier, contrat CDI, niveau, lieu) et envoie un message Telegram classé par zone et par niveau."""
 import re
 from urllib.parse import urlparse
 import pandas as pd
@@ -6,9 +7,11 @@ import sqlite3
 from datetime import datetime
 import time
 from config import envoyer, noter_passage, DATA, RAPIDE
-from connecteurs import detecter_acces, adresse_a_visiter, lire_interface, autorise, AccesImpossible
-from dedoublon import Registre, offres_deja_envoyees
-from filtre_ia import juger, juger_offres, GeminiIndisponible, TAILLE_PAQUET, TAILLE_PAQUET_OFFRES
+from connecteurs import (detecter_acces, adresse_a_visiter, lire_interface, autorise, AccesImpossible,
+                         description_smartrecruiters)
+from dedoublon import cle_titre
+from filtre_ia import (juger, juger_offres, zone, AUTRE_CONTRAT, GeminiIndisponible,
+                       TAILLE_PAQUET, TAILLE_PAQUET_OFFRES)
 from playwright.sync_api import sync_playwright
 
 BASE = f"{DATA}/veilleur.db"
@@ -19,23 +22,16 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # Une offre se reconnaît à son adresse : job, offre, emploi... ou un numéro d'identifiant
 MOTIF = re.compile(r"job|offre|offer|emploi|poste|position|vacanc|annonce|requisition|\d{4,}"
                    r"|taleez\.com/apply/(?!sp/)|breezy\.hr/p/", re.I)   # plateformes Taleez et Breezy
-# Mots d'alternance, et contrats incompatibles annoncés dans le titre (règle fixe, sans IA)
-ALTERNANCE = re.compile(r"altern|apprenti|apprentissage|contrat pro|work[- ]?study|apprenticeship", re.I)
 # Pages de vérification anti-robot affichées à la place de l'offre
 ANTI_ROBOT = re.compile(r"cloudflare|just a moment|checking your browser|v[ée]rification de s[ée]curit[ée]|"
                         r"attention required|enable javascript and cookies|captcha", re.I)
-AUTRE_CONTRAT = re.compile(r"\b(stage|stagiaire|intern|internship|cdi|cdd|graduate program)\b", re.I)
-# Lien vers la rubrique « Alternance » d'un site : le texte du lien ne contient QUE le nom de la rubrique,
-# éventuellement suivi d'un nombre d'offres (« Alternance (4) », « Alternance et apprentissage (2) »).
-# « Alternance DevOps » est une offre, pas une rubrique.
-RUBRIQUE = re.compile(r"(nos\s+)?(offres?\s+(en|d'|de)\s*)?((stages?|alternances?|apprentissage)\s*(et|&|/)\s*)?"
-                      r"(alternances?|apprentissage|stages?)\s*(\(\d+\))?", re.I)
-DEBUT_RUBRIQUE = re.compile(r"nos\s+(stages?\s+et\s+alternances?|alternances?|offres?\s+(en|d')\s*alternance)\b", re.I)
-
-
-def est_rubrique(texte):
-    texte = " ".join((texte or "").split())
-    return bool(RUBRIQUE.fullmatch(texte) and ALTERNANCE.search(texte)) or bool(DEBUT_RUBRIQUE.match(texte))
+# Mention du contrat ailleurs sur la page (encadré, bas de page) : transmise à l'IA
+# Bandeau de cookies : on le ferme pour lire l'offre (sinon le texte lu est celui du bandeau).
+# On refuse si le site le permet, sinon on accepte (navigateur jetable, rien n'est conservé).
+COOKIES = "text=/^(tout refuser|refuser tout|continuer sans accepter|reject all|decline all|tout accepter|accepter( et fermer)?|accepter tous les cookies|autoriser tous|allow all|accept all( cookies)?|j'accepte|ok)$/i"
+# Texte de lien qui n'est pas un titre : on le remplace par le titre de la page de l'offre
+TITRE_VIDE = re.compile(r"^(voir|d[ée]tails?|en savoir plus|lire la suite|postuler|apply|learn more|view|more)\b", re.I)
+MOT_CONTRAT = re.compile(r"\b(cdi|cdd|contrat|stage|altern\w*|apprenti\w*|freelance|int[ée]rim|permanent)\b", re.I)
 
 
 # ---------- 1. Collecte des liens d'offres (inchangée) ----------
@@ -67,42 +63,28 @@ def ouvrir_base():
     connexion.execute("""CREATE TABLE IF NOT EXISTS offres (
         url TEXT PRIMARY KEY, entreprise TEXT, titre TEXT, vue_le TEXT)""")
     colonnes = {c[1] for c in connexion.execute("PRAGMA table_info(offres)")}
-    for col in ("verdict", "raison", "description", "verdict2", "raison2"):
+    for col in ("verdict", "raison", "description", "verdict2", "raison2", "niveau", "ville", "departement"):
         if col not in colonnes:
             connexion.execute(f"ALTER TABLE offres ADD COLUMN {col} TEXT")
     if "envoyee" not in colonnes:
-        # DEFAULT 1 : les offres déjà en base avant le filtre IA sont considérées comme traitées
-        connexion.execute("ALTER TABLE offres ADD COLUMN envoyee INTEGER DEFAULT 1")
+        connexion.execute("ALTER TABLE offres ADD COLUMN envoyee INTEGER DEFAULT 0")
     connexion.commit()
     return connexion
 
 
 def garder_nouvelles(connexion, offres, entreprise):
-    """Enregistre les offres jamais vues. Renvoie (nouvelles, première_visite).
-    Première visite d'une entreprise ajoutée à la liste : ses offres actuelles sont jugées et envoyées
-    comme les autres (le filtre IA ne laisse passer que les alternances en informatique).
-    Seule exception : base vide (mémoire perdue) → tout est mémorisé sans jugement ni envoi."""
-    deja = connexion.execute(
-        "SELECT COUNT(*) FROM offres WHERE entreprise = ?", (entreprise,)).fetchone()[0]
-    premiere_visite = deja == 0 and BASE_VIDE
+    """Enregistre les offres jamais vues et les renvoie. Version CDI : pas de « première visite »
+    silencieuse, toutes les offres actuelles sont jugées et envoyées dès le premier passage."""
     nouvelles = {}
     for url, titre in offres.items():
         if not connexion.execute("SELECT 1 FROM offres WHERE url = ?", (url,)).fetchone():
             connexion.execute(
-                "INSERT INTO offres (url, entreprise, titre, vue_le, envoyee) VALUES (?, ?, ?, ?, ?)",
-                (url, entreprise, titre, datetime.now().isoformat(timespec="seconds"),
-                 1 if premiere_visite else 0))
+                "INSERT INTO offres (url, entreprise, titre, vue_le, envoyee) VALUES (?, ?, ?, ?, 0)",
+                (url, entreprise, titre, datetime.now().isoformat(timespec="seconds")))
             nouvelles[url] = titre
     connexion.commit()
-    return nouvelles, premiere_visite
+    return nouvelles
 
-
-# Mémoire perdue ? (aucune offre en base au démarrage)
-with sqlite3.connect(BASE) as _c:
-    try:
-        BASE_VIDE = _c.execute("SELECT COUNT(*) FROM offres").fetchone()[0] == 0
-    except sqlite3.OperationalError:
-        BASE_VIDE = True
 
 # Sites à surveiller : pages validées (✅ Fiable et 🔧 Corrigée)
 df = pd.read_excel(f"{DATA}/pages_a_surveiller.xlsx")
@@ -114,7 +96,7 @@ if RAPIDE:                                     # test rapide : 10 sites seulemen
 
 def visiter(navigateur, url, essais=2):
     """Renvoie (offres, erreur). Ne plante jamais : en cas d'échec, offres est vide."""
-    url = adresse_a_visiter(url)                 # Workday : page filtrée sur « alternance »
+    url = adresse_a_visiter(url)
     if not autorise(url):
         return {}, "lecture interdite par le robots.txt du site"
     erreur = None
@@ -140,16 +122,6 @@ def visiter(navigateur, url, essais=2):
                 if not nouvelles_offres:
                     break
                 offres.update(nouvelles_offres)
-            # Suivre la rubrique « Alternance » du site : ses offres n'apparaissent pas sur la page principale
-            for rubrique in [u for u, t in offres.items() if est_rubrique(t) and autorise(u)][:3]:
-                try:
-                    page.goto(rubrique, wait_until="domcontentloaded", timeout=30000)
-                    page.wait_for_timeout(5000)
-                    for u, t in extraire_offres(page).items():
-                        if len(t) > len(offres.get(u, "")):
-                            offres[u] = t
-                except Exception:
-                    pass
             return offres, None
         except Exception as e:
             erreur = str(e).splitlines()[0]   # 1re ligne du message suffit
@@ -160,14 +132,24 @@ def visiter(navigateur, url, essais=2):
 
 # ---------- 2. Lecture d'une offre (pour l'étape 2) ----------
 def lire_offre(navigateur, url):
-    """Texte de la page d'une offre (zone principale si elle existe), 3000 caractères au plus.
-    Renvoie "" si la page ne s'ouvre pas : l'IA jugera alors sur le titre."""
+    """Renvoie (texte, titre) : texte de la page d'une offre (zone principale si elle existe),
+    3000 caractères au plus, et le titre principal de la page (h1).
+    Texte "" si la page ne s'ouvre pas : l'IA jugera alors sur le titre."""
+    if "jobs.smartrecruiters.com/" in url:        # interface officielle : description ET lieu
+        return description_smartrecruiters(url), None
     if not autorise(url):
-        return ""
+        return "", None
     page = navigateur.new_page(user_agent=UA)
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
         page.wait_for_timeout(3000)
+        try:
+            bouton = page.locator(COOKIES).first
+            if bouton.count() and bouton.is_visible():
+                bouton.click(timeout=3000)
+                page.wait_for_timeout(1500)
+        except Exception:
+            pass                                  # pas de bandeau ou bouton non cliquable : on lit tel quel
         texte = ""
         for zone in ("main", "article", "[role=main]", "body"):
             element = page.query_selector(zone)
@@ -177,26 +159,28 @@ def lire_offre(navigateur, url):
                     break
         texte = texte[:3000]
         if ANTI_ROBOT.search(texte[:600]):         # page de vérification (Cloudflare…) : rien à lire
-            return ""
-        # Mention d'alternance ailleurs dans la page (encadré, bas de page) : on transmet la phrase
-        # elle-même, pour que l'IA distingue « Type de contrat : apprentissage » d'un slogan du site
-        if not ALTERNANCE.search(texte):
+            return "", None
+        h1 = page.query_selector("h1")
+        titre = " ".join(h1.inner_text().split())[:150] if h1 else None
+        # Contrat indiqué ailleurs dans la page (encadré, bas de page) : on transmet la phrase elle-même
+        if not MOT_CONTRAT.search(texte):
             corps = " ".join(page.inner_text("body").split())
-            trouve = ALTERNANCE.search(corps)
+            trouve = MOT_CONTRAT.search(corps)
             if trouve:
                 extrait = corps[max(0, trouve.start() - 120):trouve.end() + 120]
                 texte = texte[:2700] + f" … [ailleurs sur la page : « {extrait} »]"
-        return texte
+        return texte, titre
     except Exception:
-        return ""
+        return "", None
     finally:
         page.close()
 
 
 # ---------- 3. Message groupé ----------
-def bloc(ligne):
-    _, titre, entreprise, raison = ligne
-    return f"{titre}\n🏢 {entreprise}\n💡 {raison or '?'}\n{ligne[0]}\n"
+def bloc(o):
+    lieu = f"{o['ville'] or '?'} ({o['departement'] or '?'})"
+    niveau = " · niveau non précisé" if o["niveau"] == "non précisé" else ""
+    return f"{o['titre']}\n🏢 {o['entreprise']} · 📍 {lieu}{niveau}\n💡 {o['raison'] or '?'}\n{o['url']}\n"
 
 
 def decouper(entete, blocs, limite=3800):
@@ -237,16 +221,14 @@ with sync_playwright() as p:
             print(f"[{i}/{len(SITES)}] ⚠️  {entreprise} : {erreur}")
             bilan["erreur"].append(entreprise)
             continue
-        nouvelles, premiere_visite = garder_nouvelles(connexion, offres, entreprise)
+        nouvelles = garder_nouvelles(connexion, offres, entreprise)
         total_nouvelles += len(nouvelles)
         if descriptions:                         # description fournie par l'interface : pas besoin d'ouvrir l'offre
             connexion.executemany("UPDATE offres SET description = ? WHERE url = ?",
-                                  [(descriptions[u], u) for u in nouvelles if u in descriptions])
+                                  [(descriptions[u], u) for u in nouvelles if descriptions.get(u)])
             connexion.commit()
         source = "" if acces == "page" else f" [{acces}]"
         print(f"[{i}/{len(SITES)}] {entreprise}{source} : {len(offres)} offres, dont {len(nouvelles)} nouvelles")
-        if premiere_visite:
-            print("    (base vide : offres mémorisées, pas d'alerte)")
         if offres:
             bilan["avec offres"] += 1
         else:
@@ -259,18 +241,15 @@ with sync_playwright() as p:
     vides = [(u,) for u, t in a_juger                                       # liens sans texte ou « 375 »
              if not re.search(r"[^\W\d_]{3}", t or "")]                      # (pagination) : pas 3 lettres
     connexion.executemany("UPDATE offres SET verdict = 'non', raison = 'lien sans texte' WHERE url = ?", vides)
-    contrat = [(u,) for u, t in a_juger if AUTRE_CONTRAT.search(t or "") and not ALTERNANCE.search(t or "")]
-    connexion.executemany("UPDATE offres SET verdict = 'non', raison = 'stage, CDI ou CDD annoncé dans le titre' "
+    contrat = [(u,) for u, t in a_juger if AUTRE_CONTRAT.search(t or "")]
+    connexion.executemany("UPDATE offres SET verdict = 'non', raison = 'contrat autre que CDI annoncé dans le titre' "
                           "WHERE url = ?", contrat)
-    rubriques = [(u,) for u, t in a_juger if est_rubrique(t or "")]
-    connexion.executemany("UPDATE offres SET verdict = 'non', raison = 'rubrique (ses offres sont suivies)' "
-                          "WHERE url = ?", rubriques)
-    exclues = {u for (u,) in vides + contrat + rubriques}
+    exclues = {u for (u,) in vides + contrat}
     a_juger = [(u, t) for u, t in a_juger if u not in exclues]
     try:
         for d in range(0, len(a_juger), TAILLE_PAQUET):
             paquet = a_juger[d:d + TAILLE_PAQUET]
-            verdicts = juger([t for _, t in paquet], source="carriere")
+            verdicts = juger([t for _, t in paquet])
             connexion.executemany("UPDATE offres SET verdict = ?, raison = ? WHERE url = ?",
                                   [(v, r, u) for (u, _), (v, r) in zip(paquet, verdicts)])
             connexion.commit()
@@ -288,51 +267,67 @@ with sync_playwright() as p:
             paquet = []
             for u, t, e, desc in a_lire[d:d + TAILLE_PAQUET_OFFRES]:
                 if desc is None:                     # page jamais lue : on la lit et on la garde
-                    desc = lire_offre(navigateur, u)
+                    desc, titre_page = lire_offre(navigateur, u)
                     connexion.execute("UPDATE offres SET description = ? WHERE url = ?", (desc, u))
+                    if titre_page and TITRE_VIDE.match(t or ""):   # « Voir l'offre » → vrai titre
+                        t = titre_page
+                        connexion.execute("UPDATE offres SET titre = ? WHERE url = ?", (t, u))
                 paquet.append((u, t, e, desc))
             connexion.commit()
-            verdicts = juger_offres([(t, e, desc) for _, t, e, desc in paquet], source="carriere")
-            # Règle fixe : sur un site carrière, une alternance le dit. Si ni le titre ni l'offre
-            # (y compris un encadré ailleurs sur la page) n'en parlent, ce n'en est pas une.
-            # Une page illisible (anti-robot) ne suffit pas à rendre une offre « à vérifier ».
-            verdicts = [("non", "aucune mention d'alternance (ni dans le titre ni dans l'offre)")
-                        if v in ("oui", "à vérifier")
-                        and not ALTERNANCE.search((t or "") + " " + (desc or "")) else (v, r)
-                        for (_, t, _, desc), (v, r) in zip(paquet, verdicts)]
-            connexion.executemany("UPDATE offres SET verdict2 = ?, raison2 = ? WHERE url = ?",
-                                  [(v, r, u) for (u, *_), (v, r) in zip(paquet, verdicts) if v])
+            verdicts = juger_offres([(t, e, desc) for _, t, e, desc in paquet])
+            connexion.executemany(
+                "UPDATE offres SET verdict2 = ?, raison2 = ?, niveau = ?, ville = ?, departement = ? WHERE url = ?",
+                [(v["verdict"], v["raison"], v["niveau"], v["ville"], v["departement"], u)
+                 for (u, *_), v in zip(paquet, verdicts) if v])
             connexion.commit()
     except GeminiIndisponible as e:
         print(f"⚠️ {e} — le reste sera lu au prochain passage.")
     navigateur.close()
 
-# 4.4 Envoi groupé : les « oui », puis une section « à vérifier »
-lignes = connexion.execute(
-    "SELECT url, titre, entreprise, raison2, verdict2 FROM offres "
-    "WHERE envoyee = 0 AND verdict2 IN ('oui', 'à vérifier') ORDER BY entreprise").fetchall()
-# Doublons : même offre déjà envoyée (par le veilleur ou le capteur) ou déjà dans ce message
-registre = Registre(offres_deja_envoyees(connexion))
-oui, a_verifier = [], []
-for u, t, e, r, v in lignes:
-    if registre.est_doublon(t, e):
-        continue
-    registre.ajouter(t, e)
-    (oui if v == "oui" else a_verifier).append((u, t, e, r))
+# 4.4 Envoi : offres junior par zone, section « à vérifier », compteur des offres confirmé
+colonnes = ["url", "titre", "entreprise", "raison", "verdict", "niveau", "ville", "departement"]
+lignes = [dict(zip(colonnes, l)) for l in connexion.execute(
+    "SELECT url, titre, entreprise, raison2, verdict2, niveau, ville, departement FROM offres "
+    "WHERE envoyee = 0 AND verdict2 IN ('oui', 'à vérifier') ORDER BY entreprise")]
+# Doublon = même titre, même entreprise ET même département (une ESN publie le même poste dans
+# plusieurs villes : ce sont des offres différentes pour le candidat)
+cle = lambda o: (cle_titre(o["titre"]), (o["entreprise"] or "").lower(), (o["departement"] or "?")[:2])
+deja = {cle(dict(zip(colonnes, l))) for l in connexion.execute(
+    "SELECT url, titre, entreprise, raison2, verdict2, niveau, ville, departement FROM offres "
+    "WHERE envoyee = 1 AND verdict2 IN ('oui', 'à vérifier')")}
+a_envoyer = []
+for o in lignes:
+    if cle(o) not in deja:
+        deja.add(cle(o))
+        a_envoyer.append(o)
+# Option retenue le 10/11 : seules les offres junior (ou sans niveau précisé) sont détaillées ;
+# les offres « confirmé » restent en base pour les statistiques et sont seulement comptées.
+confirmes = [o for o in a_envoyer if o["niveau"] == "confirmé"]
+juniors = [o for o in a_envoyer if o["niveau"] != "confirmé"]
+oui = [o for o in juniors if o["verdict"] == "oui"]
+a_verifier = [o for o in juniors if o["verdict"] == "à vérifier"]
 if oui or a_verifier:
-    blocs = [bloc(l) for l in oui]
+    blocs = []
+    for z, drapeau in (("Île-de-France", "🗼"), ("Reste de la France", "🇫🇷")):
+        dans_zone = [o for o in oui if zone(o["departement"]) == z]
+        if dans_zone:
+            blocs.append(f"{drapeau} {z.upper()} — JUNIOR ({len(dans_zone)})\n")
+            blocs += [bloc(o) for o in dans_zone]
     if a_verifier:
-        blocs.append(f"🔎 À VÉRIFIER ({len(a_verifier)}) — contrat non précisé ou poste mixte\n")
-        blocs += [bloc(l) for l in a_verifier]
-    entete = (f"🌐 Veilleur — {len(oui)} alternance(s) informatique(s) sur les sites carrière\n" if oui
-              else f"🌐 Veilleur — aucune offre sûre, {len(a_verifier)} offre(s) à vérifier\n")
+        blocs.append(f"🔎 À VÉRIFIER ({len(a_verifier)}) — description illisible ou métier ambigu\n")
+        blocs += [bloc(o) for o in a_verifier]
+    if confirmes:
+        idf = sum(zone(o["departement"]) == "Île-de-France" for o in confirmes)
+        blocs.append(f"🔵 + {len(confirmes)} offre(s) confirmé non affichée(s) "
+                     f"(Île-de-France {idf}, reste {len(confirmes) - idf})\n")
+    entete = f"💼 Veilleur CDI — {len(oui)} offre(s) sûre(s), {len(a_verifier)} à vérifier\n"
     if all(envoyer(m) for m in decouper(entete, blocs)):
-        connexion.executemany("UPDATE offres SET envoyee = 1 WHERE url = ?", [(l[0],) for l in lignes])
+        connexion.executemany("UPDATE offres SET envoyee = 1 WHERE url = ?", [(o["url"],) for o in lignes])
         connexion.commit()
     else:
         print("❌ Échec d'envoi Telegram : ces offres seront renvoyées au prochain passage.")
-elif lignes:                           # uniquement des doublons : rien à envoyer, mais on les marque vus
-    connexion.executemany("UPDATE offres SET envoyee = 1 WHERE url = ?", [(l[0],) for l in lignes])
+elif lignes:                           # doublons ou confirmés seulement : rien à envoyer, on les marque vus
+    connexion.executemany("UPDATE offres SET envoyee = 1 WHERE url = ?", [(o["url"],) for o in lignes])
     connexion.commit()
 
 etape1 = dict(connexion.execute(
@@ -348,4 +343,4 @@ print("0 offre :", ", ".join(bilan["0 offre"]))
 print("Erreurs :", ", ".join(bilan["erreur"]))
 print(f"Étape 1 (titre) : {etape1}")
 print(f"Étape 2 (offre) : {etape2}")
-print(f"Envoyées : {len(oui)} oui + {len(a_verifier)} à vérifier")
+print(f"Envoyées : {len(oui)} oui + {len(a_verifier)} à vérifier (junior) ; {len(confirmes)} confirmé comptées")
