@@ -1,0 +1,70 @@
+name: Agent de veille CDI
+
+on:
+  workflow_dispatch:            # lancé toutes les 2 h par cron-job.org, ou à la main depuis l'onglet Actions
+
+concurrency:
+  group: agent-cdi              # jamais deux passages en même temps
+  cancel-in-progress: false
+
+jobs:
+  veille:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      TZ: Europe/Paris                # heures du journal et des offres en heure française
+      MODE: prod                      # config.py n'autorise ce mode que sur GitHub Actions
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+    steps:
+      - name: 1. Récupérer le code (branche main = production)
+        uses: actions/checkout@v4
+
+      - name: 2. Récupérer la mémoire (dépôt privé) dans data/
+        uses: actions/checkout@v4
+        with:
+          repository: Tresor300/Agent-IA-veille-cdi-data
+          token: ${{ secrets.DATA_TOKEN }}
+          path: data
+          fetch-depth: 0          # historique complet : indispensable pour remplacer la version du jour sans tout effacer
+
+      - name: 3. Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 4. Installer les bibliothèques (versions figées) et le navigateur
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: 5. Veilleur (sites carrière)
+        id: veilleur
+        run: python veilleur.py
+
+      - name: 6. Sauvegarder la mémoire (une version par jour)
+        if: always()
+        working-directory: data
+        run: |
+          git config user.name "agent-veille-cdi"
+          git config user.email "agent-veille-cdi@users.noreply.github.com"
+          git add veilleur.db
+          if git diff --cached --quiet; then echo "Mémoire inchangée"; exit 0; fi
+          JOUR="Mémoire du $(date +%F)"
+          if [ "$(git log -1 --pretty=%s)" = "$JOUR" ]; then
+            git commit --amend -m "$JOUR"      # même jour : on remplace la version du jour
+            git push --force
+          else
+            git commit -m "$JOUR"              # nouveau jour : nouvelle version
+            git push
+          fi
+
+      - name: 7. Alerte Telegram en cas d'échec
+        if: failure()
+        run: |
+          TEXTE="⚠️ Agent de veille CDI : échec pendant le passage
+          Détails : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" --data-urlencode "text=${TEXTE}" > /dev/null
