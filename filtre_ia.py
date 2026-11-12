@@ -19,7 +19,7 @@ load_dotenv()
 CLE = {"x-goog-api-key": os.environ["GEMINI_API_KEY"]}
 BASE = "https://generativelanguage.googleapis.com/v1beta"
 MODELES = ["models/gemini-flash-lite-latest", "models/gemini-flash-latest"]
-TAILLE_PAQUET = 50            # étape 1 : titres par appel
+TAILLE_PAQUET = 100           # étape 1 : titres par appel (100 : deux fois moins d'appels)
 TAILLE_PAQUET_OFFRES = 10     # étape 2 : offres complètes par appel
 dernier = [None]              # modèle qui a répondu en dernier : on commence par lui
 
@@ -28,6 +28,9 @@ dernier = [None]              # modèle qui a répondu en dernier : on commence 
 AUTRE_CONTRAT = re.compile(
     r"\b(stage|stagiaire|intern|internship|altern\w*|apprenti\w*|apprenticeship|contrat pro\w*|work[- ]?study|"
     r"cdd|freelance|free-lance|ind[ée]pendant|int[ée]rim\w*|v\.?i\.?e|mission temporaire)\b", re.I)
+# Niveau confirmé annoncé dans le titre (l'IA classait parfois « Expert » en « non précisé »)
+SENIOR = re.compile(r"\b(senior|s[ée]nior|sr\.?|confirm[ée]e?|exp[ée]riment[ée]e?|expert\w*|lead|staff|principal|"
+                    r"architecte?|manager|head|directeur|directrice|chief)\b", re.I)
 DEPARTEMENTS_IDF = {"75", "77", "78", "91", "92", "93", "94", "95"}
 
 
@@ -41,10 +44,13 @@ class GeminiIndisponible(Exception):
 
 
 def _appeler(texte, schema, timeout):
-    """Envoie une demande à Gemini et renvoie la réponse JSON décodée."""
+    """Envoie une demande à Gemini et renvoie la réponse JSON décodée.
+    Quota par minute dépassé (429) : on attend une minute, trois fois au plus, avant de changer de modèle.
+    Chaque refus est affiché avec son code, pour distinguer quota par minute et quota par jour."""
     ordre = sorted(MODELES, key=lambda m: m != dernier[0])
     for modele in ordre:
-        for _ in range(2):
+        nom = modele.split("/")[-1]
+        for essai in range(4):
             try:
                 r = requests.post(f"{BASE}/{modele}:generateContent", headers=CLE, timeout=timeout, json={
                     "contents": [{"parts": [{"text": texte}]}],
@@ -52,19 +58,24 @@ def _appeler(texte, schema, timeout):
                                          "responseSchema": schema},
                 })
             except requests.RequestException:
-                print(f"   … {modele.split('/')[-1]} ne répond pas")
-                continue
+                print(f"   … {nom} ne répond pas")
+                break                            # délai dépassé : inutile d'insister, modèle suivant
             if not r.ok:
-                if r.status_code in (429, 500, 503):
-                    time.sleep(10)               # surcharge temporaire : petite pause, on réessaie
+                detail = " ".join(r.text.split())[:160]
+                print(f"   … {nom} refuse (code {r.status_code}) : {detail}")
+                if r.status_code == 429 and "PerDay" not in r.text and essai < 3:
+                    time.sleep(60)               # quota par minute : il se libère en une minute
                     continue
-                break                            # autre erreur : modèle suivant
+                if r.status_code in (500, 503) and essai < 3:
+                    time.sleep(30)               # modèle surchargé (« high demand ») : on patiente
+                    continue
+                break                            # quota du jour ou autre erreur : modèle suivant
             try:
                 reponse = json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
                 dernier[0] = modele
                 return reponse
             except (KeyError, IndexError, ValueError, TypeError):
-                print(f"   réponse illisible de {modele.split('/')[-1]}, nouvel essai")
+                print(f"   réponse illisible de {nom}, nouvel essai")
     raise GeminiIndisponible("Gemini n'a pas pu juger ce paquet")
 
 
@@ -79,8 +90,10 @@ CONSIGNE = (
     "Pour chaque texte, réponds :\n"
     "- \"oui\" : un des métiers de la liste ;\n"
     "- \"non\" : autre métier, Y COMPRIS toute la data (data analyst, data engineer, data scientist, BI, "
-    "big data), le support ou helpdesk, technicien, chef de projet, Product Owner, Product Manager, PMO, "
-    "AMOA, commercial, RH, finance, industrie ; OU ce n'est pas une offre (lien de navigation, « Voir toutes "
+    "big data), le support ou helpdesk, technicien, l'automatisme industriel (automates, PLC, SCADA, supervision), l'administration d'outils bureautiques ou collaboratifs (Microsoft 365, messagerie, postes de travail), chef de projet, Product Owner, Product Manager, PMO, "
+    "AMOA, commercial, RH, finance, industrie, automatisme industriel (automates, PLC, SCADA, supervision AVEVA, "
+    "PANORAMA, WinCC), administration d'outils bureautiques ou collaboratifs (Microsoft 365, poste de travail) ; "
+    "OU ce n'est pas une offre (lien de navigation, « Voir toutes "
     "les offres », rubrique, nom d'équipe, page entreprise, « Postuler », « Candidature spontanée ») ;\n"
     "- \"doute\" : texte trop vague pour connaître le métier (« Ingénieur H/F », « Consultant IT », "
     "« Voir l'offre », « En savoir plus »).\n"
@@ -117,8 +130,11 @@ CONSIGNE_OFFRES = (
     "SRE, ingénieur plateforme, DevSecOps, QA et test automatisé, cybersécurité (SOC, pentest, GRC), "
     "administration systèmes et réseaux informatiques.\n"
     "MÉTIER — NON, sans exception : toute la data (data analyst, data engineer, data scientist, BI, big data, "
-    "même avec du code), support, helpdesk, technicien, chef de projet ou PMO même informatique, Product Owner, "
-    "Product Manager, AMOA/MOA, commercial, management, industrie, maintenance matérielle.\n"
+    "même avec du code), support, helpdesk, technicien, automatisme industriel (programmation d'automates, PLC, SCADA, supervision industrielle comme AVEVA, Panorama ou WinCC), administration d'outils bureautiques ou collaboratifs (Microsoft 365, messagerie, postes de travail), chef de projet ou PMO même informatique, Product Owner, "
+    "Product Manager, AMOA/MOA, commercial, management, industrie, maintenance matérielle, automatisme industriel "
+    "(programmation d'automates, PLC, SCADA, supervision AVEVA, PANORAMA, WinCC), administration d'outils "
+    "bureautiques ou collaboratifs (Microsoft 365, Teams, SharePoint, poste de travail). Le logiciel embarqué ou "
+    "temps réel (C, C++, Ada) reste OUI.\n"
     "CONTRAT : seul le CDI est retenu. CDD, stage, alternance, apprentissage, freelance, intérim, VIE = \"non\". "
     "Les sites carrière n'écrivent pas toujours « CDI » : un emploi permanent sans autre contrat indiqué est "
     "considéré comme un CDI. Un poste hors de France = \"non\". Si la page n'est pas UNE offre précise "
@@ -162,6 +178,8 @@ def juger_offres(offres):
         v = par_numero.get(i)
         if v and v["verdict"] != "non" and AUTRE_CONTRAT.search(titre or ""):
             v = {**v, "verdict": "non", "raison": "contrat autre que CDI annoncé dans le titre"}
+        if v and v.get("niveau") != "confirmé" and SENIOR.search(titre or ""):
+            v = {**v, "niveau": "confirmé"}
         if v and v["verdict"] != "non" and v.get("departement", "").lower().startswith("étranger"):
             v = {**v, "verdict": "non", "raison": "poste hors de France"}
         resultats.append(v)
@@ -183,6 +201,9 @@ if __name__ == "__main__":
         ("Ingénieur QA automatisation", "Exemple SA", ""),
         ("Chef de projet informatique", "Exemple SA", "CDI à Paris, pilotage de projets SI."),
         ("Software Engineer", "Exemple Inc", "Permanent position in Berlin, Germany. Go and Kubernetes."),
+        ("Ingénieur Développement AVEVA H/F", "Exemple SA", "CDI à Lyon. Programmation d'automates et "
+         "supervision avec AVEVA System Platform."),
+        ("Administrateur Microsoft 365", "Exemple SA", "CDI à Angers. Administrer Teams, SharePoint et la messagerie."),
     ]
     print(f"{'Titre':38} {'verdict':11} {'niveau':12} zone (ville)")
     for (t, _, _), v in zip(exemples, juger_offres(exemples)):

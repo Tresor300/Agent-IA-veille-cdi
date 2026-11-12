@@ -20,6 +20,8 @@ BASE = f"{DATA}/veilleur.db"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 # Une offre se reconnaît à son adresse : job, offre, emploi... ou un numéro d'identifiant
+# Sites exclus par nos règles d'accès (conditions d'utilisation) : un lien vers eux n'est jamais lu
+EXCLUS = re.compile(r"(^|\.)(indeed\.|linkedin\.com|welcometothejungle\.com|hellowork\.com|glassdoor\.)", re.I)
 MOTIF = re.compile(r"job|offre|offer|emploi|poste|position|vacanc|annonce|requisition|\d{4,}"
                    r"|taleez\.com/apply/(?!sp/)|breezy\.hr/p/", re.I)   # plateformes Taleez et Breezy
 # Pages de vérification anti-robot affichées à la place de l'offre
@@ -49,6 +51,8 @@ def extraire_offres(page):
         if not href.startswith("http") or href.rstrip("/") == page_url:
             continue
         lien = urlparse(href)
+        if EXCLUS.search(lien.netloc):
+            continue
         sous_page = (lien.netloc.removeprefix("www.") == base.netloc.removeprefix("www.") and len(base.path.strip("/")) > 0
                      and lien.path.rstrip("/").startswith(base.path.rstrip("/") + "/"))
         if MOTIF.search(href) or sous_page:
@@ -105,6 +109,11 @@ def visiter(navigateur, url, essais=2):
         try:
             reponse = page.goto(url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(5000)   # 5 s pour laisser la liste s'afficher
+            if "myworkday" in url:        # Workday : liste chargée en JavaScript, parfois lente
+                try:
+                    page.wait_for_selector("[data-automation-id='jobTitle']", timeout=25000)
+                except Exception:
+                    pass                  # vraiment aucune offre : la page reste vide
             if reponse and reponse.status >= 400:
                 raise Exception(f"code HTTP {reponse.status}")
             titre = page.title().lower()
@@ -117,7 +126,7 @@ def visiter(navigateur, url, essais=2):
                 if not suivant or not suivant.is_enabled():
                     break
                 suivant.click()
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(5000 if "myworkday" in url else 3000)   # Workday : page suivante lente
                 nouvelles_offres = {u: t for u, t in extraire_offres(page).items() if u not in offres}
                 if not nouvelles_offres:
                     break
@@ -143,6 +152,11 @@ def lire_offre(navigateur, url):
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
         page.wait_for_timeout(3000)
+        if "myworkday" in url:            # Workday : description chargée en JavaScript
+            try:
+                page.wait_for_selector("[data-automation-id='jobPostingDescription']", timeout=15000)
+            except Exception:
+                pass
         try:
             bouton = page.locator(COOKIES).first
             if bouton.count() and bouton.is_visible():

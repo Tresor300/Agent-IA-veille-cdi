@@ -44,6 +44,17 @@ def adresse_a_visiter(url):
 
 
 # ---------- Interfaces officielles ----------
+# Lieu en France (ou non précisé) : les autres offres ne sont même pas proposées à l'IA
+FRANCE = re.compile(r"france|paris|lyon|marseille|toulouse|nantes|bordeaux|lille|rennes|nice|montpellier|grenoble|"
+                    r"strasbourg|sophia|la d[ée]fense|nanterre|boulogne|levallois|issy|saint-denis|courbevoie|"
+                    r"[îi]le-de-france|\bfr\b", re.I)
+
+
+def en_france(lieu):
+    return not (lieu or "").strip() or bool(FRANCE.search(lieu))
+
+
+
 def _texte(contenu_html):
     sans_balises = re.sub(r"<[^>]+>", " ", html.unescape(html.unescape(contenu_html or "")))
     return " ".join(sans_balises.split())[:3000]
@@ -62,7 +73,7 @@ def _get(url, **params):
 def _greenhouse(jeton):
     donnees = _get(f"https://boards-api.greenhouse.io/v1/boards/{jeton}/jobs", content="true")
     return {o["absolute_url"]: (o["title"], _texte(f"{(o.get('location') or {}).get('name', '')} — {o.get('content', '')}"))
-            for o in donnees.get("jobs", [])}
+            for o in donnees.get("jobs", []) if en_france((o.get("location") or {}).get("name"))}
 
 
 def _lever(societe):
@@ -70,6 +81,8 @@ def _lever(societe):
     offres = {}
     for o in donnees:
         cat = o.get("categories") or {}
+        if not en_france(cat.get("location")):
+            continue
         listes = " ".join(f"{l.get('text', '')} {_texte(l.get('content', ''))}" for l in o.get("lists", []))
         offres[o["hostedUrl"]] = (o["text"], _texte(f"Contrat : {cat.get('commitment', '?')} — Lieu : {cat.get('location', '?')} — "
                                                      f"{o.get('descriptionPlain', '')} {listes}"))
@@ -99,7 +112,7 @@ def _recruitee(societe):
     return {o["careers_url"]: (o["title"], _texte(f"Contrat : {o.get('employment_type_code', '?')} — "
                                                   f"Lieu : {o.get('location', '?')} — {o.get('description', '')} "
                                                   f"{o.get('requirements', '')}"))
-            for o in donnees.get("offers", [])}
+            for o in donnees.get("offers", []) if en_france(o.get("location"))}
 
 
 def description_smartrecruiters(url):
